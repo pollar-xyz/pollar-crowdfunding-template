@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import '@pollar/react/styles.css';
 import './globals.css';
 import Providers from './providers';
 import Header from '../components/Header';

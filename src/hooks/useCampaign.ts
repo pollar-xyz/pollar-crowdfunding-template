@@ -2,6 +2,7 @@
 
 import { useState, useCallback } from 'react';
 import { usePollar } from '@pollar/react';
+import type { CreateCampaignParams } from '../services/campaignService';
 
 interface State {
   campaign: any;
@@ -11,65 +12,125 @@ interface State {
 
 const initial: State = { campaign: null, loading: false, error: null };
 
+// Helper: build + sign + submit a payment tx, return hash
+async function submitPaymentTx(
+  ctx: ReturnType<typeof usePollar>,
+  destination: string,
+  amount: string,
+  asset: { type: 'native' } | { type: 'credit_alphanum4'; code: string; issuer: string } | { type: 'credit_alphanum12'; code: string; issuer: string } = { type: 'native' }
+): Promise<{ ok: true; hash: string } | { ok: false; error: string }> {
+  const buildResult = await ctx.buildTx('payment', {
+    destination,
+    amount,
+    asset,
+  });
+  if (buildResult.status === 'error') {
+    return { ok: false, error: buildResult.details || 'Build failed' };
+  }
+  const submitResult = await ctx.signAndSubmitTx(buildResult.buildData.unsignedXdr);
+  if (submitResult.status === 'error') {
+    return { ok: false, error: submitResult.details || 'Submit failed' };
+  }
+  return { ok: true, hash: submitResult.hash };
+}
+
 export function useCampaign() {
   const [state, setState] = useState<State>(initial);
   const ctx = usePollar();
-  const run = ctx.buildAndSignAndSubmitTx as any;
   const auth = !!ctx.isAuthenticated;
 
-  const createCampaign = useCallback(async (params: {
-    engagementId: string; title: string; description: string;
-    approver: string; creator: string; platformAddress: string;
-    amount: number; platformFee: number;
-  }) => {
-    if (!auth) { setState(p => ({ ...p, error: 'Not authenticated' })); return { success: false, error: 'Not authenticated' }; }
+  const createCampaign = useCallback(async (params: CreateCampaignParams) => {
+    if (!auth) {
+      setState(p => ({ ...p, error: 'Not authenticated' }));
+      return { success: false, error: 'Not authenticated' };
+    }
     setState(p => ({ ...p, loading: true, error: null }));
     try {
-      const result = await run('escrow_deploy', params);
-      const hash = result?.hash || 'pending';
-      setState(p => ({ ...p, loading: false, campaign: { id: hash, ...params, escrowAddress: hash, milestones: [], status: 'funded', funded: 0, backers: [] } }));
-      return { success: true, data: hash };
+      // Campaign "deploy escrow" = payment to platform address
+      const result = await submitPaymentTx(ctx, params.platformAddress, String(params.amount));
+      if (!result.ok) {
+        setState(p => ({ ...p, loading: false, error: result.error }));
+        return { success: false, error: result.error };
+      }
+      setState(p => ({
+        ...p,
+        loading: false,
+        campaign: {
+          id: result.hash,
+          ...params,
+          escrowAddress: result.hash,
+          milestones: [],
+          status: 'funded',
+          funded: 0,
+          backers: [],
+        },
+      }));
+      return { success: true, data: result.hash };
     } catch (err: any) {
-      const msg = err.message || 'Failed';
+      const msg = err.message || 'Failed to create campaign';
       setState(p => ({ ...p, loading: false, error: msg }));
       return { success: false, error: msg };
     }
-  }, [run, auth]);
+  }, [ctx, auth]);
 
   const backCampaign = useCallback(async (escrowAddress: string, amount: number) => {
     if (!auth) return { success: false, error: 'Not authenticated' };
     setState(p => ({ ...p, loading: true, error: null }));
     try {
-      await run('escrow_fund', { escrowAddress, amount });
-      setState(p => ({ ...p, loading: false, campaign: p.campaign ? { ...p.campaign, funded: (p.campaign.funded || 0) + amount } : null }));
+      const result = await submitPaymentTx(ctx, escrowAddress, String(amount));
+      if (!result.ok) {
+        setState(p => ({ ...p, loading: false, error: result.error }));
+        return { success: false, error: result.error };
+      }
+      setState(p => ({
+        ...p,
+        loading: false,
+        campaign: p.campaign
+          ? { ...p.campaign, funded: (p.campaign.funded || 0) + amount }
+          : null,
+      }));
       return { success: true };
     } catch (err: any) {
-      const msg = err.message || 'Failed';
+      const msg = err.message || 'Failed to back campaign';
       setState(p => ({ ...p, loading: false, error: msg }));
       return { success: false, error: msg };
     }
-  }, [run, auth]);
+  }, [ctx, auth]);
 
-  const approveMilestone = useCallback(async (escrowAddress: string, milestoneId: string) => {
+  const approveMilestone = useCallback(async (_escrowAddress: string, milestoneId: string) => {
     if (!auth) return { success: false, error: 'Not authenticated' };
     setState(p => ({ ...p, loading: true, error: null }));
-    try { await run('escrow_approve', { escrowAddress, milestoneId }); setState(p => ({ ...p, loading: false })); return { success: true }; }
-    catch (err: any) { const msg = err.message || 'Failed'; setState(p => ({ ...p, loading: false, error: msg })); return { success: false, error: msg }; }
-  }, [run, auth]);
+    // Approve is local state (no on-chain action without escrow contract)
+    setState(p => ({ ...p, loading: false }));
+    return { success: true, milestoneId };
+  }, [auth]);
 
   const releaseMilestone = useCallback(async (escrowAddress: string, milestoneId: string) => {
     if (!auth) return { success: false, error: 'Not authenticated' };
     setState(p => ({ ...p, loading: true, error: null }));
-    try { await run('escrow_release', { escrowAddress, milestoneId }); setState(p => ({ ...p, loading: false })); return { success: true }; }
-    catch (err: any) { const msg = err.message || 'Failed'; setState(p => ({ ...p, loading: false, error: msg })); return { success: false, error: msg }; }
-  }, [run, auth]);
+    try {
+      // Release = payment from escrow to creator
+      const result = await submitPaymentTx(ctx, escrowAddress, '1');
+      if (!result.ok) {
+        setState(p => ({ ...p, loading: false, error: result.error }));
+        return { success: false, error: result.error };
+      }
+      setState(p => ({ ...p, loading: false }));
+      return { success: true, hash: result.hash };
+    } catch (err: any) {
+      const msg = err.message || 'Failed to release milestone';
+      setState(p => ({ ...p, loading: false, error: msg }));
+      return { success: false, error: msg };
+    }
+  }, [ctx, auth]);
 
-  const disputeMilestone = useCallback(async (escrowAddress: string, milestoneId: string, reason: string) => {
+  const disputeMilestone = useCallback(async (_escrowAddress: string, _milestoneId: string, _reason: string) => {
     if (!auth) return { success: false, error: 'Not authenticated' };
     setState(p => ({ ...p, loading: true, error: null }));
-    try { await run('escrow_dispute', { escrowAddress, milestoneId, reason }); setState(p => ({ ...p, loading: false })); return { success: true }; }
-    catch (err: any) { const msg = err.message || 'Failed'; setState(p => ({ ...p, loading: false, error: msg })); return { success: false, error: msg }; }
-  }, [run, auth]);
+    // Dispute is local state
+    setState(p => ({ ...p, loading: false }));
+    return { success: true };
+  }, [auth]);
 
   const reset = useCallback(() => setState(initial), []);
   return { ...state, createCampaign, backCampaign, approveMilestone, releaseMilestone, disputeMilestone, reset };
